@@ -1,0 +1,14 @@
+# 5s scrape interval: verification runs in ~1 minute per scenario, not ~10.
+global:
+  scrape_interval: 5s
+  scrape_timeout: 3s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: api
+    static_configs:
+      - targets: ["api:8000"]
+
+  - job_name: worker
+    static_configs:
+      - targets: ["worker:9100"]

@@ -1,0 +1,119 @@
+# Victim stack: deliberately fragile, deliberately observable.
+# Every knob that inject.py touches is a ${VAR} sourced from .env.
+name: victim-stack
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: victim
+      POSTGRES_PASSWORD: victim
+      POSTGRES_DB: victim
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U victim -d victim"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "5432:5432"
+
+  cache:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    command: ["-host=0.0.0.0", "-config=/config/toxiproxy.json"]
+    volumes:
+      - ./toxiproxy/config.json:/config/toxiproxy.json:ro
+    ports:
+      - "8474:8474"   # control API, driven by inject.py
+    depends_on:
+      cache:
+        condition: service_healthy
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    environment:
+      SERVICE_NAME: api
+      LOG_DIR: /var/log/victim
+      DB_HOST: db
+      DB_PORT: "${API_DB_PORT:-5432}"          # bad-config scenario flips this
+      DB_NAME: victim
+      DB_USER: victim
+      DB_PASSWORD: victim
+      DB_POOL_MAX: "5"                          # load-bearing for pool-exhaustion
+      DB_POOL_ACQUIRE_TIMEOUT: "2.0"
+      DB_QUERY_HOLD_SECONDS: "0.15"
+      REDIS_HOST: toxiproxy                     # api reaches cache THROUGH toxiproxy
+      REDIS_PORT: "26379"
+      REDIS_TIMEOUT: "1.0"
+      CACHE_TTL_SECONDS: "30"
+    volumes:
+      - ./logs:/var/log/victim
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      toxiproxy:
+        condition: service_started
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    environment:
+      SERVICE_NAME: worker
+      LOG_DIR: /var/log/victim
+      REDIS_HOST: cache                         # worker reaches cache DIRECTLY
+      REDIS_PORT: "6379"
+      LEAK_MEMORY: "${WORKER_LEAK_MEMORY:-0}"   # oom-crashloop scenario flips this
+      LEAK_MB_PER_TICK: "8"        # ~12s crash cycles: several restarts per soak window
+      WARMUP_SECONDS: "6"          # restart gap must clear heartbeat noise by a wide margin
+      HEARTBEAT_SECONDS: "1"
+    volumes:
+      - ./logs:/var/log/victim
+    ports:
+      - "9100:9100"
+    mem_limit: 128m
+    restart: unless-stopped
+    depends_on:
+      cache:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=1h"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api
+      - worker
+
+  # Rogue client. Not started by `make up` -- inject.py brings it up on demand.
+  leaker:
+    build:
+      context: .
+      dockerfile: leaker/Dockerfile
+    profiles: ["inject"]
+    environment:
+      TARGET_URL: http://api:8000/widgets/1
+      CONCURRENCY: "6"      # > DB_POOL_MAX, so the pool never drains
+      HOLD_SECONDS: "10"
+    depends_on:
+      - api
