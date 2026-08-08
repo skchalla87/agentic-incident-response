@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
 
 jobs:
@@ -11,8 +11,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-        with:
-          python-version: "3.11"
-      - run: uv pip install --system -r requirements-dev.txt
-      - run: ruff check .
-      - run: pytest -q
+
+      # Deliberately the same two commands the README tells a human to run.
+      # A separate CI-only install recipe is free to drift from the documented
+      # setup; this cannot. `make bootstrap` creates the 3.11 venv (uv fetches
+      # the interpreter if needed) and `make check` runs ruff + pytest out of it.
+      - run: make bootstrap
+      - run: make check
