@@ -23,6 +23,40 @@ Tags to use freely: `#observability` `#docker` `#scenario-design` `#tooling`
 
 ---
 
+## 2026-08-08 — "Not identical" is a much weaker claim than "separable" `#scenario-design`
+
+**Context:** review of the verification harness after it had been passing for
+several days.
+
+**Surprise:** the distinguishability check — the whole justification for the
+harness — was the weakest assertion in the file.
+
+**Cause:** it tested exact vector equality. That proves no two scenarios are
+*identical*; it says nothing about how close they came. Going back through the
+round-1 output, the healthy control and a crashlooping worker had differed on
+exactly **one** signal (`worker_mem_sawtooth`), and the collision check had
+passed them. The per-scenario assertions caught that run, so the weakness never
+surfaced as a failure — it was masked by a stronger check sitting next to it.
+
+**Consequence:** separation is now a distance with a floor (fault↔fault ≥ 3,
+anything↔healthy ≥ 2), measured two ways: **observed** (this run) and
+**guaranteed** (what `EXPECTED` promises, ignoring don't-cares). The guaranteed
+form is the one that can be enforced without Docker, so it now runs in
+`make check`. Also moved `api_cpu_flat` out of the vector into
+`HEALTH_ASSERTIONS` — it is constant across all scenarios, so counting it as a
+discriminator overstated the evidence width.
+
+**Also learned, about the review itself:** the margin estimate in the review
+was wrong. It cited pool-exhaustion vs bad-config as evidence margins were
+comfortable, but that pair is not the binding constraint — healthy vs
+bad-config is, at distance 2. **When someone claims a margin is fine, compute
+all the pairs; the one they picked is rarely the tightest.**
+
+**Cost:** ~40 min including a confirming sweep. Cheap for converting a
+qualitative claim into a number the eval can be judged on.
+
+---
+
 ## 2026-08-04 — The test harness bypassed the CLI, so the CLI was broken the whole time `#tooling`
 
 **Context:** running `inject.py status` by hand, after `make verify` had

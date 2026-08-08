@@ -33,9 +33,16 @@ RESTART_WINDOW_PAD = 20
 # reset() itself causes outside every measurement window.
 SETTLE_SECONDS = 25
 
-# Signal name -> (description, threshold-bearing evaluator)
-# Every evaluator returns a (bool, observed_value) pair.
-SIGNAL_ORDER = [
+# How far apart two scenarios must be, in signals, to count as separable.
+# Fault-vs-fault is the demanding case: mistaking one failure for another is
+# what destroys an eval. Fault-vs-healthy is an easier discrimination and gets
+# a lower bar.
+MIN_FAULT_DISTANCE = 3
+MIN_HEALTHY_DISTANCE = 2
+
+# Signals that can actually differ between scenarios. This -- not every signal
+# we check -- is the vector the distinguishability analysis operates on.
+DISCRIMINATORS = [
     "pool_pegged",
     "pool_timeouts",
     "p99_db_high",
@@ -47,8 +54,16 @@ SIGNAL_ORDER = [
     "worker_mem_sawtooth",
     "worker_log_gap",
     "error_rate_step",
-    "api_cpu_flat",
 ]
+
+# Asserted on every run, but structurally constant across scenarios -- nothing
+# here makes the *api* burn CPU, so this cannot discriminate. It is a health
+# assertion ("the pool-exhaustion failure is a waiting failure, not a working
+# one"), and counting it as a signal would overstate how wide the evidence
+# vector really is.
+HEALTH_ASSERTIONS = ["api_cpu_flat"]
+
+SIGNAL_ORDER = [*DISCRIMINATORS, *HEALTH_ASSERTIONS]
 
 # None == don't care. See docs/failure-scenarios.md for the prose version.
 EXPECTED = {
@@ -232,6 +247,95 @@ def check_contract() -> list[str]:
     return problems
 
 
+# ---------------------------------------------------------------------------
+# Distinguishability
+#
+# Two distances, answering two different questions. Do not collapse them.
+#
+#   observed  -- how far apart the scenarios came out on THIS run. Built from
+#                measured booleans, so a don't-care field still counts. That is
+#                deliberate: comparing EXPECTED dicts directly would make every
+#                None collide with everything and the check would be useless.
+#
+#   guaranteed -- how far apart the CONTRACT promises they are: coordinates
+#                where both scenarios have a non-None expectation and those
+#                expectations disagree. Don't-cares score zero here, by
+#                construction. This is the number worth quoting, because the
+#                observed distance can be propped up by an unasserted signal
+#                that merely happened to differ.
+#
+# A pair separated only by noise scores well on observed and zero on
+# guaranteed, which is exactly the hole the second metric exists to close.
+# ---------------------------------------------------------------------------
+def observed_distance(left: dict, right: dict) -> int:
+    return sum(left[s][0] != right[s][0] for s in DISCRIMINATORS)
+
+
+def guaranteed_distance(left: str, right: str) -> int:
+    a, b = EXPECTED[left], EXPECTED[right]
+    return sum(
+        1
+        for s in DISCRIMINATORS
+        if a[s] is not None and b[s] is not None and a[s] != b[s]
+    )
+
+
+def min_distance_threshold(left: str, right: str) -> int:
+    """Fault-vs-fault is the demanding case; anything-vs-healthy is easier."""
+    return MIN_HEALTHY_DISTANCE if "healthy" in (left, right) else MIN_FAULT_DISTANCE
+
+
+def analyse_separation(results: dict) -> tuple[list[str], list[tuple]]:
+    """Return (failures, rows) for every scenario pair."""
+    failures: list[str] = []
+    rows: list[tuple] = []
+    names = list(results)
+    for i, left in enumerate(names):
+        for right in names[i + 1 :]:
+            obs = observed_distance(results[left], results[right])
+            gtd = guaranteed_distance(left, right)
+            floor = min_distance_threshold(left, right)
+            rows.append((left, right, obs, gtd, floor))
+            if obs == 0:
+                failures.append(
+                    f"COLLISION: {left} and {right} produced identical telemetry signatures"
+                )
+            elif obs < floor:
+                failures.append(
+                    f"TOO CLOSE: {left} and {right} differ on only {obs} observed signal(s), "
+                    f"need {floor} -- an agent reading noisy telemetry could confuse them"
+                )
+            if gtd < floor:
+                failures.append(
+                    f"UNDER-SPECIFIED: {left} and {right} are contractually guaranteed to "
+                    f"differ on only {gtd} signal(s), need {floor} -- their separation on "
+                    f"this run relies on signals nothing asserts"
+                )
+    return failures, rows
+
+
+def print_separation(rows: list[tuple]) -> None:
+    if not rows:
+        return
+    ordered = sorted(rows, key=lambda row: (row[2], row[3]))
+    print("\npairwise separation, in signals (observed / guaranteed)")
+    print("-" * 62)
+    for index, (left, right, obs, gtd, floor) in enumerate(ordered):
+        marker = "  <-- tightest" if index == 0 else ""
+        print(f"  {left:<16} {right:<16} {obs} / {gtd}   (floor {floor}){marker}")
+
+    faults = [row for row in ordered if "healthy" not in (row[0], row[1])]
+    if faults:
+        print(
+            f"\n  minimum fault-to-fault separation : "
+            f"{faults[0][2]} observed, {faults[0][3]} guaranteed"
+        )
+    print(
+        f"  minimum overall separation        : "
+        f"{ordered[0][2]} observed, {ordered[0][3]} guaranteed"
+    )
+
+
 def run_scenario(
     name: str, baseline_seconds: int, soak_seconds: int
 ) -> dict[str, tuple[bool, float]]:
@@ -311,17 +415,12 @@ def main(argv: list[str] | None = None) -> int:
                 verb = "expected but missing" if expectation else "unexpected"
                 failures.append(f"{name}: {signal} {verb} (observed {value})")
 
-    # Distinguishability: no two scenarios may present the same signal vector.
-    vectors = {
-        name: tuple(observed[s][0] for s in SIGNAL_ORDER) for name, observed in results.items()
-    }
-    names = list(vectors)
-    for i, left in enumerate(names):
-        for right in names[i + 1 :]:
-            if vectors[left] == vectors[right]:
-                failures.append(
-                    f"COLLISION: {left} and {right} produced identical telemetry signatures"
-                )
+    # Distinguishability. Not merely "no two scenarios are identical" -- that
+    # bar is too low. Round 1 of this suite once put a crashlooping worker ONE
+    # signal away from the healthy control and the equality check said nothing.
+    separation_failures, rows = analyse_separation(results)
+    failures.extend(separation_failures)
+    print_separation(rows)
 
     contract_problems = check_contract()
     failures.extend(f"contract: {problem}" for problem in contract_problems)
@@ -333,7 +432,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  - {failure}")
         return 1
 
-    print(f"PASS: {len(results)} scenario(s), all signatures distinct and as documented")
+    tightest = min((row[2], row[3]) for row in rows) if rows else (0, 0)
+    print(
+        f"PASS: {len(results)} scenario(s) as documented; tightest pair separated by "
+        f"{tightest[0]} observed / {tightest[1]} guaranteed signal(s)"
+    )
     return 0
 
 
