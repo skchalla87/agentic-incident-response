@@ -29,7 +29,20 @@ and an unscoped query can read the wrong service's series.
 | `worker_mem_sawtooth` | metric | max/min of `worker_memory_bytes` > 1.5 |
 | `worker_log_gap` | **log** | largest gap between `worker.memory_sampled` records > 5s |
 | `error_rate_step` | metric | `increase(http_requests_total{status=~"5.."})` > 5 |
+
+Plus one **health assertion**, checked every run but deliberately excluded from
+the signal vector:
+
+| Assertion | Source | Holds when |
+|---|---|---|
 | `api_cpu_flat` | metric | `rate(process_cpu_seconds_total{job="api"})` < 0.5 |
+
+`api_cpu_flat` is true in every scenario and structurally cannot differ —
+nothing here makes the *api* burn CPU (oom-crashloop burns it on the
+**worker**). It still matters: it is what makes pool-exhaustion a *waiting*
+failure rather than a *working* one. But counting it as a discriminator would
+overstate how wide the evidence really is, so it lives in `HEALTH_ASSERTIONS`
+rather than `DISCRIMINATORS`.
 
 ### Two thresholds that are subtler than they look
 
@@ -164,8 +177,66 @@ make verify ARGS="--soak 90 --baseline 30"
 
 `verify.py` resets, baselines, injects, soaks, and asserts **both** directions
 of every non-`·` cell — expected signals present *and* unexpected signals
-absent. It then compares the full observed signal vectors pairwise and fails on
-any two that are identical. Finally it re-checks the log files against the
-observability contract.
+absent. Then it measures separation (below). Finally it re-checks the log files
+against the observability contract.
 
 A `FAIL` here means the sandbox is defective. Fix the stack, not the assertion.
+
+---
+
+## Separation: distinctness is not enough
+
+"No two scenarios are identical" is too low a bar. Two scenarios differing on a
+single signal are technically distinct and practically confusable by anything
+reading noisy telemetry.
+
+This is not hypothetical. In the first verification run, before the
+metric-shadowing bug was found, the healthy control and a **crashlooping
+worker** came out one bit apart — they differed only on
+`worker_mem_sawtooth`. An exact-equality check called that pair distinct.
+
+So separation is measured as a **distance**, in two forms:
+
+| Measure | Built from | Answers |
+|---|---|---|
+| **observed** | measured booleans on this run | how far apart they *came out* |
+| **guaranteed** | the `EXPECTED` contract | how far apart they are *promised* to be |
+
+Guaranteed distance counts only coordinates where both scenarios have a
+non-`·` expectation and those expectations disagree. Don't-cares score zero by
+construction — which is the point. A pair whose separation rests on an
+unasserted signal that merely happened to differ scores well on observed and
+poorly on guaranteed, and that gap is the thing worth knowing.
+
+Both must clear a floor, and the floor depends on the pair:
+
+- **fault ↔ fault: ≥ 3.** Mistaking one failure for another is what destroys
+  an eval.
+- **anything ↔ healthy: ≥ 2.** Telling "broken" from "fine" is an easier
+  discrimination and earns a lower bar.
+
+Current contract guarantees:
+
+```
+2  (floor 2)  healthy <-> bad-config          <-- tightest
+3  (floor 2)  healthy <-> cache-latency
+3  (floor 2)  healthy <-> oom-crashloop
+4  (floor 2)  healthy <-> pool-exhaustion
+4  (floor 3)  cache-latency <-> bad-config
+4  (floor 3)  pool-exhaustion <-> bad-config
+5  (floor 3)  oom-crashloop <-> bad-config
+5  (floor 3)  pool-exhaustion <-> cache-latency
+6  (floor 3)  oom-crashloop <-> cache-latency
+7  (floor 3)  pool-exhaustion <-> oom-crashloop
+
+minimum fault-to-fault : 4
+minimum overall        : 2
+```
+
+The tightest pair is healthy ↔ bad-config, separated by `api_restarted` and
+`error_rate_step`. Both must fail for the two to be confused.
+
+**This property is enforced in CI**, not only by the 12-minute sweep:
+`test_contract_guarantees_every_pair_is_separable` computes guaranteed
+distances straight from `EXPECTED` in milliseconds, with no Docker. Editing the
+expectation matrix into an unsolvable sandbox fails `make check` immediately.

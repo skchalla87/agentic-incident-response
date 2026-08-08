@@ -129,6 +129,8 @@ scenario signature.
 | worker leaks `b"x" * n`, not `bytearray(n)` | zeroed bytearrays can stay lazily mapped and never move RSS |
 | `inject.py` starts the leaker with `--no-deps` | otherwise compose recreates the api and scenario 1 steals scenario 4's signature |
 | cache signal is a hit **ratio**, not a hit rate | any slowdown cuts absolute hit rate; only a cache fault moves the ratio |
+| `api_cpu_flat` is a health assertion, not a discriminator | it is constant across scenarios; counting it would overstate the evidence width |
+| separation is a **distance with a floor**, not exact inequality | two scenarios one signal apart are distinct but confusable |
 | restart signals use a wider window than rate signals | `changes()` needs the last pre-restart sample inside the range |
 | cache errors degrade to db (200), not 503, on reads | keeps 5xx rate a *distinct* signal |
 | bad-config uses a wrong **port**, not a wrong host | ECONNREFUSED is instant; DNS would hang and mimic scenario 1 |
@@ -145,7 +147,8 @@ failed `make verify` run. See `LEARNINGS.md`.
    to have to fix something.
 3. Adding a scenario → add it to `inject.py`, to `EXPECTED` in `verify.py`, and
    to `docs/failure-scenarios.md`. A scenario without a row in the
-   discrimination matrix does not exist.
+   discrimination matrix does not exist. `make check` will reject it if its
+   contract-guaranteed separation from an existing scenario is too small.
 4. Non-obvious findings and debugging scars go in `LEARNINGS.md`, dated.
 
 ## Not in this repo (yet, or ever)

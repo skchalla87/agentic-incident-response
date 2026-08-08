@@ -113,6 +113,62 @@ def test_every_scenario_has_an_expectation_row():
         assert set(expectations) == set(verify.SIGNAL_ORDER), name
 
 
+def test_discriminators_and_health_assertions_partition_the_signals():
+    import verify
+
+    assert not set(verify.DISCRIMINATORS) & set(verify.HEALTH_ASSERTIONS)
+    assert set(verify.SIGNAL_ORDER) == set(verify.DISCRIMINATORS) | set(verify.HEALTH_ASSERTIONS)
+
+
+def test_health_assertions_really_are_constant():
+    """Anything that differs between scenarios belongs in DISCRIMINATORS."""
+    import verify
+
+    for signal in verify.HEALTH_ASSERTIONS:
+        values = {row[signal] for row in verify.EXPECTED.values()}
+        assert len(values) == 1, f"{signal} differs between scenarios -- it is a discriminator"
+
+
+def test_contract_guarantees_every_pair_is_separable():
+    """The design property, enforced in CI without Docker.
+
+    A 12-minute sweep proves separation happened once. This proves the
+    *contract* promises it, so editing EXPECTED cannot silently degrade the
+    sandbox into one where two faults are indistinguishable.
+    """
+    import verify
+
+    names = list(verify.EXPECTED)
+    for i, left in enumerate(names):
+        for right in names[i + 1 :]:
+            distance = verify.guaranteed_distance(left, right)
+            floor = verify.min_distance_threshold(left, right)
+            assert distance >= floor, (
+                f"{left} vs {right}: contract guarantees only {distance} differing "
+                f"signal(s), need {floor}"
+            )
+
+
+def test_guaranteed_distance_ignores_dont_cares(monkeypatch):
+    import verify
+
+    monkeypatch.setattr(verify, "DISCRIMINATORS", ["a", "b"])
+    monkeypatch.setitem(verify.EXPECTED, "_left", {"a": True, "b": None})
+    monkeypatch.setitem(verify.EXPECTED, "_right", {"a": False, "b": True})
+    # 'a' is asserted on both sides and disagrees; 'b' is a don't-care.
+    assert verify.guaranteed_distance("_left", "_right") == 1
+
+
+def test_observed_distance_counts_measured_disagreement(monkeypatch):
+    import verify
+
+    monkeypatch.setattr(verify, "DISCRIMINATORS", ["a", "b"])
+    left = {"a": (True, 1.0), "b": (False, 0.0)}
+    right = {"a": (False, 0.0), "b": (False, 0.0)}
+    assert verify.observed_distance(left, right) == 1
+    assert verify.observed_distance(left, left) == 0
+
+
 def test_scalar_treats_nan_as_default(monkeypatch):
     monkeypatch.setattr(promql, "query", lambda expr: [({}, float("nan"))])
     assert promql.scalar("whatever", default=7.0) == 7.0
